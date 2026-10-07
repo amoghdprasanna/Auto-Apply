@@ -130,24 +130,12 @@ def extract(reply: str) -> Optional[str]:
 
 
 def as_document(original: str, pasted: str) -> tuple[str, bool]:
-    """A reply that is only the body becomes a whole document again.
-
-    The prompt asks for the body alone - the preamble is the person's own
-    design, it is identical on every job, and a model asked to repeat two
-    hundred lines of it will eventually reflow one of them. So the master's
-    preamble and its closing line are put back around what was pasted.
+    """A reply that is only the body becomes a whole document again
+    (`tailor.wrap_body`, which the API path uses too).
 
     Returns the document and whether anything had to be put back.
     """
-    body = (pasted or "").strip()
-    if r"\begin{document}" in body:
-        return body, False
-    head = original.find(r"\begin{document}")
-    tail = original.rfind(r"\end{document}")
-    if head == -1 or tail == -1:
-        return body, False
-    head += len(r"\begin{document}")
-    return original[:head] + "\n" + body + "\n" + original[tail:], True
+    return tailor_module.wrap_body(original, pasted)
 
 
 def accept(reply: str, posting: Posting, resume_tex: Optional[str] = None,

@@ -22,7 +22,7 @@ from typing import Callable, Optional
 
 import paths
 
-from . import layout, llm, profile as profile_module, prompts, structure
+from . import layout, llm, profile as profile_module, prompts, quality, structure
 from .fetch import Posting
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -57,7 +57,8 @@ MATCH: <one sentence on why this candidate fits>
 ```
 
 ```tex
-<the complete tailored LaTeX source, whole file, preamble included>
+<the tailored body: everything between \\begin{document} and \\end{document},
+neither line included. Leave the preamble out; the master's is put back.>
 ```
 
 ```markdown
@@ -175,6 +176,39 @@ def master_problems(tex: str) -> list[str]:
     if not bullets(split_sections(tex)["EXPERIENCE"]):
         return ["no bullets under the experience section (\\item or \\resumeItem)"]
     return []
+
+
+def wrap_body(original: str, body: str) -> tuple[str, bool]:
+    """A reply that is only the body becomes a whole document again.
+
+    The reply format asks for the body alone (2026-10-06; the "Use Opus" paste
+    did first): the preamble is the person's own design, identical on every
+    job, never tailored, and on the default model every token written costs a
+    hundred read - so two and a half thousand characters of it, retyped on
+    every attempt, were a quarter of the tailoring bill for nothing. The
+    master's preamble and closing line are put back around the body. A whole
+    document (an edited format, an old habit) is taken as it is.
+
+    Returns the document and whether anything had to be put back.
+    """
+    body = (body or "").strip()
+    if r"\begin{document}" in body:
+        return body, False
+    head = original.find(r"\begin{document}")
+    tail = original.rfind(r"\end{document}")
+    if head == -1 or tail == -1:
+        return body, False
+    head += len(r"\begin{document}")
+    return original[:head] + "\n" + body + "\n" + original[tail:], True
+
+
+def body_of(tex: str) -> str:
+    """What lies between \\begin{document} and \\end{document}."""
+    head = tex.find(r"\begin{document}")
+    tail = tex.rfind(r"\end{document}")
+    if head == -1 or tail == -1:
+        return tex
+    return tex[head + len(r"\begin{document}"):tail].strip("\n")
 
 
 def restore_preamble(original: str, tailored: str) -> tuple[str, bool]:
@@ -504,6 +538,143 @@ def overrun_report(original: str, tailored: str) -> str:
     return report + ("\n" + "\n".join(blocks) if blocks else "")
 
 
+# -- the fix-only retry (2026-10-06) ---------------------------------------
+#
+# A line-budget rejection used to be answered with the whole file again. On
+# the default model an output token costs a hundred input tokens, so every
+# such retry bought the resume a second time - and 24 of the 63 budget
+# rejections on disk were one character over, the same character on three
+# attempts in a row on one job, because a model regenerating 8k characters
+# does not hold one line still. Now the rejected attempt goes back as the
+# model's own turn and only the items that grew are asked for, each with its
+# cap; the replacements are spliced in by exact text and the whole attempt
+# is checked again. A reply that does not splice falls back to the old
+# full retry.
+
+@dataclass
+class Overrun:
+    name: str                # the label the reply uses, e.g. "bullet 4"
+    text: str                # the item exactly as it sits in the attempt
+    used: int                # visible characters now
+    cap: Optional[int]       # visible characters it may use; None inside a block
+
+
+GREW = "these grew past their line budget"
+
+
+def overruns(original: str, tailored: str) -> Optional[tuple[list[Overrun], str]]:
+    """The items of `tailored` that print on more lines than the master's, and
+    a note on any block section among them. None when something other than
+    length is wrong with them (a count changed), which a fix cannot mend."""
+    width = layout.chars_per_line()
+    try:
+        pairs = _paired_bodies(original, tailored)
+    except TailorError:
+        return None
+    items: list[Overrun] = []
+    for index, before, after, section in pairs:
+        if section in BLOCK_SECTIONS:
+            continue
+        was, _, _ = layout.budget(before, width)
+        now, _, used = layout.budget(after, width)
+        if now > was:
+            items.append(Overrun(f"bullet {index}", after, used, was * width + layout.SLACK))
+
+    notes = []
+    for name in BLOCK_SECTIONS:
+        was, now = _section_lines(original, name, width), _section_lines(tailored, name, width)
+        if was is None or now is None or now <= was:
+            continue
+        bodies = [body for body, section in _bullets_with_sections(tailored) if section == name]
+        _, used = _block_chars(tailored, name, width)
+        fits = was * width + layout.SLACK
+        items += [Overrun(f"{name.lower()} entry {k}", body, len(layout.visible(body)), None)
+                  for k, body in enumerate(bodies, 1)]
+        notes.append(f"The {name} entries together may use {fits} visible characters and "
+                     f"use {used}: cut {max(1, used - fits)} from whichever entries the "
+                     "posting needs least, and return only the entries you change.")
+
+    before, after = _skill_lines(original), _skill_lines(tailored)
+    if len(before) != len(after):
+        return None
+    singles = [("the summary", _summary(original).strip(), _summary(tailored).strip())]
+    singles += [(f"skills line {i}", b, a) for i, (b, a) in enumerate(zip(before, after), 1)]
+    for name, b, a in singles:
+        if not b or not a:
+            continue
+        was, _, _ = layout.budget(b, width)
+        now, _, used = layout.budget(a, width)
+        if now > was:
+            items.append(Overrun(name, a, used, was * width + layout.SLACK))
+    return items, " ".join(notes)
+
+
+FIX_FORMAT = """
+Reply with only the replacements, in one fenced block, each item under an
+`@@` line naming it exactly as listed, and nothing else:
+
+```fix
+@@ bullet 4
+<the new text of that bullet, exactly as it goes inside its macro>
+@@ skills line 2
+<the whole new line, its bold category included>
+```
+
+Each replacement keeps the item's facts, its links and the posting's terms
+you put there; it only gets shorter. Every other part of the resume stays as
+you sent it. Count visible characters: LaTeX commands and URLs do not print.
+"""
+
+
+def fix_request(items: list[Overrun], note: str) -> str:
+    rows = []
+    for item in items:
+        cap = (f"at most {item.cap} visible characters (now {item.used})"
+               if item.cap is not None else f"now {item.used} visible characters")
+        rows.append(f"- {item.name}: {cap}\n  {item.text}")
+    return ("## Your attempt is kept, except for these\n\n"
+            "These items grew past their line budget: they print on more lines "
+            "than the master's and push the page. Shorten each to fit."
+            + (f" {note}" if note else "")
+            + "\n\n" + "\n".join(rows) + "\n" + prompts.text("tailor.fix"))
+
+
+FIX_HEAD = re.compile(r"^@@[ \t]*(.+?)[ \t]*$", re.M)
+
+
+def apply_fixes(tailored: str, items: list[Overrun], reply: str) -> Optional[str]:
+    """`tailored` with each `@@` replacement spliced over the item it names,
+    or None when the reply is not something that can be spliced."""
+    block = _extract_block(reply, ("fix",))
+    if block is None:
+        block = reply if FIX_HEAD.search(reply) else None
+    if block is None:
+        return None
+    parts = FIX_HEAD.split(block)
+    named = {item.name.lower(): item for item in items}
+    head = max(0, tailored.find(r"\begin{document}"))
+    out, changed = tailored, 0
+    for name, text in zip(parts[1::2], parts[2::2]):
+        item = named.get(name.strip().lower())
+        new = text.strip()
+        if item is None or not new:
+            continue
+        # A bullet sent back in its macro is still that bullet.
+        macro = re.match(r"\\resumeItem\s*\{", new)
+        if macro and not item.text.lstrip().startswith("\\resumeItem"):
+            inner = structure.balanced(new, macro.end() - 1)
+            if inner is not None:
+                new = inner.strip()
+        if new == item.text:
+            continue
+        at = out.find(item.text, head)
+        if at == -1:
+            return None
+        out = out[:at] + new + out[at + len(item.text):]
+        changed += 1
+    return out if changed else None
+
+
 # ------------------------------------------------------- what was invented --
 
 # A number on a resume is a claim the reader can check, and until now nothing
@@ -814,7 +985,7 @@ def _build_user_message(posting: Posting, resume: str, profile: str) -> str:
         for name, lines, fits, used in rows
     )
 
-    sections = [f"## Job posting\n\n{posting.to_markdown()}"]
+    sections = [f"## Job posting\n\n{posting.to_markdown(cap=quality.PROMPT_CAP)}"]
     if profile:
         sections.append(
             "## Candidate profile (background not necessarily on the resume)\n\n" + profile
@@ -934,47 +1105,69 @@ def tailor(
     last_error: Optional[str] = None
     rejected: list[dict] = []
     preamble_notes: list[str] = []
+    # Set by a line-budget rejection: the attempt and what grew in it. The
+    # next attempt then asks for those items only (`fix_request`).
+    fix: Optional[tuple[str, list[Overrun], str]] = None
+    reply = verdict = ""
     for attempt in range(1, max_attempts + 1):
-        reply = llm.complete(system, message + feedback, model=model)
-
-        verdict = _extract_block(reply, ("verdict",)) or ""
-        if verdict.strip().upper().startswith("MISMATCH"):
-            raise Mismatch(verdict.strip())
-
-        tailored = _extract_block(reply, ("tex", "latex"))
-        if tailored is not None:
-            tailored, restored = restore_preamble(original, tailored)
-            if restored:
-                # Worth seeing on the review page: it means the model is
-                # spending attention above \\begin{document}, where there is
-                # nothing to win.
-                spliced = "the preamble was restored from the master"
-                if spliced not in preamble_notes:
-                    preamble_notes.append(spliced)
-        if tailored is None:
-            last_error = "model reply contained no ```tex block"
-            rejected.append({"attempt": attempt, "reason": last_error, "tex": reply})
-            feedback = f"\n\n## Your previous attempt failed\n\n{last_error}. Try again."
-            continue
-
-        # A model squeezed by the length rules will sometimes return the file
-        # untouched, which is a non-answer rather than a tailoring pass.
-        if _normalise(tailored) == _normalise(original):
-            last_error = "returned the resume unchanged"
-            feedback = (
-                "\n\n## Your previous attempt was rejected\n\n"
-                "You returned the resume unchanged. Tailoring it is the task. "
-                "Find the places where the posting names something the candidate "
-                "has actually done and uses a different word for it, and adopt the "
-                "posting's word. Reorder the projects and the skills lines so the "
-                "most relevant come first. Keep every length the same by trading: "
-                "if a phrase gets longer, shorten another in the same bullet.\n\n"
-                "If after genuinely looking there is nothing truthful to change, "
-                "say so in the rationale and return the file unchanged again."
-            )
-            if attempt < max_attempts:
-                rejected.append({"attempt": attempt, "reason": last_error, "tex": tailored})
+        if fix is not None:
+            candidate, items, note = fix
+            fix = None
+            answer = llm.chat([
+                {"role": "system", "content": system},
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": f"```tex\n{body_of(candidate)}\n```"},
+                {"role": "user", "content": fix_request(items, note)},
+            ], model=model)
+            tailored = apply_fixes(candidate, items, answer)
+            if tailored is None:
+                # `feedback` still holds the full retry, which is what the
+                # next attempt sends.
+                last_error = "the length fix could not be applied to the attempt"
+                rejected.append({"attempt": attempt, "reason": last_error, "tex": answer})
                 continue
+        else:
+            reply = llm.complete(system, message + feedback, model=model)
+
+            verdict = _extract_block(reply, ("verdict",)) or ""
+            if verdict.strip().upper().startswith("MISMATCH"):
+                raise Mismatch(verdict.strip())
+
+            tailored = _extract_block(reply, ("tex", "latex"))
+            if tailored is not None:
+                tailored, _ = wrap_body(original, tailored)
+                tailored, restored = restore_preamble(original, tailored)
+                if restored:
+                    # Worth seeing on the review page: it means the model is
+                    # spending attention above \\begin{document}, where there
+                    # is nothing to win.
+                    spliced = "the preamble was restored from the master"
+                    if spliced not in preamble_notes:
+                        preamble_notes.append(spliced)
+            if tailored is None:
+                last_error = "model reply contained no ```tex block"
+                rejected.append({"attempt": attempt, "reason": last_error, "tex": reply})
+                feedback = f"\n\n## Your previous attempt failed\n\n{last_error}. Try again."
+                continue
+
+            # A model squeezed by the length rules will sometimes return the
+            # file untouched, which is a non-answer rather than a tailoring pass.
+            if _normalise(tailored) == _normalise(original):
+                last_error = "returned the resume unchanged"
+                feedback = (
+                    "\n\n## Your previous attempt was rejected\n\n"
+                    "You returned the resume unchanged. Tailoring it is the task. "
+                    "Find the places where the posting names something the candidate "
+                    "has actually done and uses a different word for it, and adopt the "
+                    "posting's word. Reorder the projects and the skills lines so the "
+                    "most relevant come first. Keep every length the same by trading: "
+                    "if a phrase gets longer, shorten another in the same bullet.\n\n"
+                    "If after genuinely looking there is nothing truthful to change, "
+                    "say so in the rationale and return the body unchanged again."
+                )
+                if attempt < max_attempts:
+                    rejected.append({"attempt": attempt, "reason": last_error, "tex": tailored})
+                    continue
 
         try:
             warnings = _validate(original, tailored, profile, posting.text)
@@ -983,11 +1176,16 @@ def tailor(
             rejected.append({"attempt": attempt, "reason": last_error, "tex": tailored})
             feedback = (
                 f"\n\n## Your previous attempt was rejected\n\n{last_error}\n\n"
-                "Return the whole file again with that fixed. Keep every other edit "
+                "Return the whole body again with that fixed. Keep every other edit "
                 "you made: the tailoring is wanted, only the named problem is not. "
                 "Reverting to the master resume is a worse answer than the attempt "
                 "you just sent."
             )
+            # Only length: ask for the items that grew, not the resume again.
+            if last_error.startswith(GREW) and attempt < max_attempts:
+                found = overruns(original, tailored)
+                if found and found[0]:
+                    fix = (tailored, *found)
             continue
 
         # How much moved. Rejected while there are attempts left, carried as a
@@ -1034,7 +1232,7 @@ def tailor(
                 feedback = (
                     f"\n\n## Your previous attempt was rejected\n\n"
                     f"It {last_error}.\n\n{overrun_report(original, tailored)}\n\n"
-                    "Return the whole file again with those bullets cut back inside "
+                    "Return the whole body again with those bullets cut back inside "
                     "their line budgets. Keep every other edit you made; do not revert "
                     "to the master resume. Do not delete a bullet, do not remove a "
                     "section, and do not touch the spacing knobs in the preamble."

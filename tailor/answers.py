@@ -19,7 +19,7 @@ from typing import Optional
 
 from browser import guard
 
-from . import cover, llm, prompts
+from . import cover, llm, prompts, quality
 
 RULES = Path(__file__).resolve().parent / "answer_rules.md"
 
@@ -87,7 +87,7 @@ class Context:
     def as_message(self) -> str:
         sections = []
         if self.posting:
-            sections.append(f"## Job posting\n\n{self.posting}")
+            sections.append(f"## Job posting\n\n{quality.for_prompt(self.posting)}")
         if self.profile:
             sections.append(f"## Candidate profile\n\n{self.profile}")
         if self.applicant:

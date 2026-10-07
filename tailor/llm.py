@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
+import time
 from typing import Iterator
 from pathlib import Path
 from typing import Optional
@@ -39,6 +41,17 @@ DEFAULT_MAX_TOKENS = 32000
 # null content. Tailoring is a careful edit, not a puzzle, so a low effort is
 # both sufficient and much cheaper.
 REASONING_EFFORT = os.environ.get("OPENROUTER_REASONING_EFFORT", "low")
+
+
+# Which of a model's providers OpenRouter sends a call to (2026-10-06).
+# One model is served by dozens of providers at prices twenty times apart -
+# z-ai/glm-5.3 from $0.06 to $2.80 per million input tokens - and the default
+# routing sent every measured call to a $1.40 one, so a form answer (5k tokens
+# in, a sentence out) cost twenty times what the cheapest provider charges for
+# the same model. "price" takes the cheapest first and still falls back to the
+# others when it fails; "" restores OpenRouter's own load balancing, and
+# "throughput" or "latency" are the other two orders it offers.
+PROVIDER_SORT = os.environ.get("OPENROUTER_PROVIDER_SORT", "price").strip()
 
 
 class LLMError(RuntimeError):
@@ -112,13 +125,16 @@ def _headers() -> dict:
 
 def _payload(messages: list[dict], model: Optional[str], temperature: float,
              max_tokens: int, reasoning: Optional[dict]) -> dict:
-    return {
+    payload = {
         "model": model or tailor_model(),
         "temperature": temperature,
         "max_tokens": max_tokens,
         "reasoning": reasoning or {"effort": REASONING_EFFORT},
         "messages": messages,
     }
+    if PROVIDER_SORT:
+        payload["provider"] = {"sort": PROVIDER_SORT}
+    return payload
 
 
 def complete(
@@ -190,11 +206,27 @@ def chat(
 # question is first whether it is already happening - OpenRouter passes a
 # provider's automatic cache straight through, and only Anthropic and
 # Gemini need explicit `cache_control` breakpoints - so the counts are
-# logged rather than guessed at. A tailoring run sends the rules, the master
-# resume, the posting and the stories (11k tokens measured) up to four times
-# for one job and again for the next, so the repeated prefix is most of
-# every call; `cached_tokens` on a second attempt is what says whether that
-# prefix is being charged twice.
+# logged rather than guessed at.
+#
+# Every call is also appended to `data/usage.jsonl` (2026-10-06), with the
+# function that asked for it, because the first two attempts at cutting the
+# bill were reconstructed from folder contents and got the answer wrong: on
+# the default tailor model an output token costs a hundred input tokens, so
+# the reasoning and the regenerated file are the bill, not the prompt.
+USAGE_FILE = "usage.jsonl"
+
+
+def _caller() -> str:
+    """`module.function` of the first frame outside this file."""
+    frame = sys._getframe(1)
+    while frame is not None and frame.f_code.co_filename == __file__:
+        frame = frame.f_back
+    if frame is None:
+        return ""
+    module = frame.f_globals.get("__name__", "?").rsplit(".", 1)[-1]
+    return f"{module}.{frame.f_code.co_name}"
+
+
 def _log_usage(data: dict, model: str) -> None:
     usage = data.get("usage") or {}
     if not usage:
@@ -202,9 +234,21 @@ def _log_usage(data: dict, model: str) -> None:
     details = usage.get("prompt_tokens_details") or {}
     cached = details.get("cached_tokens") or usage.get("cache_read_input_tokens") or 0
     prompt = usage.get("prompt_tokens") or 0
-    log.info("%s: prompt=%s cached=%s (%s%%) completion=%s cost=%s", model, prompt, cached,
-             round(100 * cached / prompt) if prompt else 0,
-             usage.get("completion_tokens"), usage.get("cost"))
+    reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+    log.info("%s: prompt=%s cached=%s (%s%%) completion=%s reasoning=%s cost=%s", model,
+             prompt, cached, round(100 * cached / prompt) if prompt else 0,
+             usage.get("completion_tokens"), reasoning, usage.get("cost"))
+    row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "kind": _caller(),
+           "model": data.get("model") or model, "provider": data.get("provider"),
+           "prompt": prompt, "cached": cached,
+           "completion": usage.get("completion_tokens") or 0, "reasoning": reasoning,
+           "cost": usage.get("cost")}
+    try:
+        paths.DATA.mkdir(parents=True, exist_ok=True)
+        with open(paths.DATA / USAGE_FILE, "a") as out:
+            out.write(json.dumps(row) + "\n")
+    except OSError as exc:      # a full disk is no reason to lose the reply
+        log.warning("usage not recorded: %s", exc)
 
 
 def stream(
@@ -238,6 +282,8 @@ def stream(
                     continue
                 if event.get("error"):
                     raise LLMError(f"OpenRouter stream error: {str(event['error'])[:400]}")
+                if event.get("usage"):
+                    _log_usage(event, model or tailor_model())
                 for choice in event.get("choices") or []:
                     text = (choice.get("delta") or {}).get("content")
                     if text:

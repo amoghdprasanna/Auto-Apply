@@ -57,7 +57,11 @@ def stub_model(monkeypatch, *replies):
         sent.append(user)
         return replies[min(len(sent) - 1, len(replies) - 1)]
 
+    def chat(messages, **kwargs):
+        return complete(messages[0]["content"], messages[-1]["content"])
+
     monkeypatch.setattr(tailor.llm, "complete", complete)
+    monkeypatch.setattr(tailor.llm, "chat", chat)
     monkeypatch.setattr(tailor.llm, "tailor_model", lambda: "test/model")
     return sent
 
@@ -577,3 +581,113 @@ def test_a_missed_swap_is_sent_back_once_and_shipped_with_a_warning(monkeypatch)
     assert len(sent) == 2 and "no PROJECTS entry was swapped" in sent[1]
     assert any("no PROJECTS entry was swapped" in w for w in result.warnings)
     assert any("auto-apply" in r for r in result.rejections)
+
+
+# --- the fix-only retry and the body-only reply (2026-10-06) -----------------
+# On the default model an output token costs a hundred input tokens, so what
+# the model writes is the bill: the preamble is not asked for, and a line
+# budget broken by a few characters is mended by naming those items alone.
+
+GROWN = ORIGINAL.replace(
+    "Cut p95 latency 52 percent with a Redis caching layer",
+    "Cut p95 latency 52 percent with a Redis caching layer, an async database "
+    "driver and connection pooling in front of it")
+EDITED = GROWN.replace("scalable Python service", "scalable Python backend")
+SHORT = r"\normalsize{Cut p95 latency 52 percent with Redis}"
+
+
+def _record(monkeypatch, complete_replies, chat_replies):
+    calls = []
+
+    def complete(system, user, **kwargs):
+        calls.append(("complete", user))
+        return complete_replies[min(sum(c[0] == "complete" for c in calls),
+                                    len(complete_replies)) - 1]
+
+    def chat(messages, **kwargs):
+        calls.append(("chat", messages))
+        return chat_replies[min(sum(c[0] == "chat" for c in calls), len(chat_replies)) - 1]
+
+    monkeypatch.setattr(tailor.llm, "complete", complete)
+    monkeypatch.setattr(tailor.llm, "chat", chat)
+    monkeypatch.setattr(tailor.llm, "tailor_model", lambda: "test/model")
+    return calls
+
+
+def test_a_line_budget_rejection_asks_only_for_what_grew(monkeypatch):
+    calls = _record(monkeypatch, [reply(tailor.body_of(EDITED))],
+                    [f"```fix\n@@ bullet 2\n{SHORT}\n```"])
+
+    result = tailor.tailor(POSTING, resume_tex=ORIGINAL, profile="")
+
+    assert [kind for kind, _ in calls] == ["complete", "chat"]
+    messages = calls[1][1]
+    # The attempt goes back as the model's own turn, and the ask names only
+    # the bullet that grew - nothing of the request is sent a second time.
+    assert messages[2]["role"] == "assistant" and "Python backend" in messages[2]["content"]
+    ask = messages[-1]["content"]
+    assert "bullet 2" in ask and "line budget" in ask
+    assert "Python backend" not in ask and POSTING.text not in ask
+    # Spliced over that bullet; every other edit of the attempt stands.
+    assert SHORT in result.tex and "Python backend" in result.tex
+    assert result.attempts == 2
+
+
+def test_a_fix_that_cannot_be_spliced_falls_back_to_the_full_retry(monkeypatch):
+    good = ORIGINAL.replace("scalable Python service", "scalable Python backend").replace(
+        "Cut p95 latency 52 percent with a Redis caching layer",
+        "Cut p95 latency 52 percent with a Redis cache")
+    calls = _record(monkeypatch, [reply(EDITED), reply(good)], ["I could not do that."])
+
+    result = tailor.tailor(POSTING, resume_tex=ORIGINAL, profile="")
+
+    assert [kind for kind, _ in calls] == ["complete", "chat", "complete"]
+    assert "line budget" in calls[2][1]
+    assert "Redis cache}" in result.tex and result.attempts == 3
+
+
+def test_apply_fixes_refuses_an_item_it_cannot_find():
+    items = [tailor.Overrun("bullet 2", "not in the resume", 20, 10)]
+    assert tailor.apply_fixes(EDITED, items, "```fix\n@@ bullet 2\nshorter\n```") is None
+    # And a reply that names nothing it was asked for changes nothing.
+    items = [tailor.Overrun("bullet 2", "Redis", 5, 10)]
+    assert tailor.apply_fixes(EDITED, items, "```fix\n@@ bullet 9\nshorter\n```") is None
+
+
+def test_overruns_names_the_grown_bullet_by_the_rejections_numbering():
+    items, note = tailor.overruns(ORIGINAL, GROWN)
+    assert [item.name for item in items] == ["bullet 2"]
+    assert items[0].text in GROWN and items[0].used > items[0].cap
+    assert note == ""
+
+
+def test_a_body_only_reply_gets_the_masters_preamble(monkeypatch):
+    changed = ORIGINAL.replace("scalable Python service", "scalable Python backend").replace(
+        "Cut p95 latency 52 percent with a Redis caching layer",
+        "Cut p95 latency 52 percent with a Redis cache")
+    stub_model(monkeypatch, reply(tailor.body_of(changed)))
+
+    result = tailor.tailor(POSTING, resume_tex=ORIGINAL, profile="")
+
+    assert result.tex.startswith(ORIGINAL[:ORIGINAL.index(r"\begin{document}")])
+    assert result.tex.rstrip().endswith(r"\end{document}")
+    assert not any("preamble" in w for w in result.warnings)
+    assert "begin{document} and" in tailor.REPLY_FORMAT
+
+
+def test_a_huge_posting_reaches_the_models_capped(monkeypatch):
+    from tailor import cover, quality
+
+    lines = ["Requirements: Python, distributed systems, caching."]
+    lines += [f"Footer item {i}: our offices, our values and our careers site." for i in range(2500)]
+    huge = Posting(url="https://example.com/jobs/2", text="\n".join(lines),
+                   title="Backend Engineer", company="Example Corp")
+    assert len(huge.text) > 140_000
+
+    message = tailor._build_user_message(huge, ORIGINAL, "")
+    letter = cover._user_message(huge, ORIGINAL, "", "")
+    for sent in (message, letter):
+        assert "Requirements: Python" in sent
+        assert len(sent) < quality.PROMPT_CAP + len(ORIGINAL) + 4000
+    # A posting under the cap goes through as it was written.
+    assert POSTING.text in tailor._build_user_message(POSTING, ORIGINAL, "")

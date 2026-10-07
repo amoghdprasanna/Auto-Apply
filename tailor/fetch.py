@@ -17,6 +17,8 @@ from typing import Optional
 
 import httpx
 
+from .quality import for_prompt
+
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -71,7 +73,12 @@ class Posting:
         return cls(url=fields["url"], text=body.strip(), title=fields["title"],
                    company=fields["company"], location=fields["location"])
 
-    def to_markdown(self) -> str:
+    def to_markdown(self, cap: Optional[int] = None) -> str:
+        """The posting as a document. `cap` is for a prompt: the text is put
+        through `quality.for_prompt`, the archive copy is always whole."""
+        text = self.text
+        if cap is not None:
+            text = for_prompt(text, cap)
         header = [f"# {self.title or 'Job posting'}"]
         if self.company:
             header.append(f"**Company:** {self.company}")
@@ -80,7 +87,7 @@ class Posting:
         header.append(f"**Source:** {self.url}")
         if self.text_source:
             header.append(f"**Text from:** {self.text_source}")
-        return "\n\n".join(header) + "\n\n---\n\n" + self.text + "\n"
+        return "\n\n".join(header) + "\n\n---\n\n" + text + "\n"
 
 
 class _TextExtractor(HTMLParser):

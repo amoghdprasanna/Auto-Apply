@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from . import llm, prompts
+from . import llm, prompts, quality
 from .fetch import Posting
 
 RULES = Path(__file__).resolve().parent / "cover_rules.md"
@@ -59,7 +59,7 @@ def system_prompt() -> str:
 
 
 def _user_message(posting: Posting, resume_tex: str, profile: str, extra: str) -> str:
-    sections = [f"## Job posting\n\n{posting.to_markdown()}"]
+    sections = [f"## Job posting\n\n{posting.to_markdown(cap=quality.PROMPT_CAP)}"]
     if profile:
         sections.append("## Candidate profile\n\n" + profile)
     sections.append(f"## The tailored resume, as LaTeX\n\n```tex\n{resume_tex}\n```")

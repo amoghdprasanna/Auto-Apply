@@ -1284,6 +1284,43 @@ invariants first.
     employer name.
 - **Token reduction, cycle 2** (opened 2026-10-02): every token-reduction
   change asked for from here on lands here, not in cycle 1.
+  - **Measured 2026-10-06, and it was not the prompt.** Cycle 1's notes said
+    TR2-TR6 were implemented; only TR1 was.
+    The 70 tailored folders took **2.0 attempts per job** on average, and 24
+    of the 63 line-budget rejections were one character over - the same
+    character three attempts running on `105d`. Each retry rewrote the whole
+    file. And the provider: `z-ai/glm-5.3` is served by ~40 providers from
+    $0.06 to $2.80 per million input tokens and $1.32 to $8.80 output, and
+    OpenRouter's default routing sent every measured call to Modal or
+    Crusoe ($1.40 / $4.40). Prompt order for the cache (TR4) was not done:
+    the cache is per provider and the rest dwarfs it.
+  - **Cheapest provider first** (`llm.PROVIDER_SORT`, `provider.sort =
+    "price"` on every call, `OPENROUTER_PROVIDER_SORT=""` restores the load
+    balancing). Live, same posting: $0.016 on Relace against $0.028 on Modal
+    for the same first attempt, 39 s for two attempts against 91 s for one.
+    The input-heavy calls (form answers, the story pick, the letter) drop
+    about tenfold. Quality per provider is not measured; Relace's
+    quantisation is not published. If tailoring gets worse, this is the
+    first switch to try.
+  - **The reply is the body** (`REPLY_FORMAT`, `tailor.wrap_body`, shared
+    with `byhand.as_document`): 2.6k characters of preamble were retyped on
+    every attempt. `rules.md` says so too.
+  - **A line-budget rejection asks for what grew** (`tailor.overruns`,
+    `fix_request`, `apply_fixes`, the `tailor.fix` prompt): the attempt goes
+    back as the assistant's turn, the overrun items are listed with their
+    caps, `@@ name` replacements are spliced by exact text and the attempt is
+    validated again. Live: 125 completion tokens against ~3,300 for the full
+    retry, spliced and clean. A count change, or a reply that does not
+    splice, falls back to the full retry. It still counts as an attempt.
+  - **Postings are capped** (`quality.for_prompt`, `PROMPT_CAP` 12k; cleaned
+    first, then cut, only when over): tailor, letter and answers. One
+    posting on disk was 484k characters.
+  - **Every call is logged** to `data/usage.jsonl` with the calling
+    function, provider, prompt / cached / completion / reasoning tokens and
+    cost. Read it before the next round instead of reconstructing.
+  - The suite now sets a dummy `OPENROUTER_API_KEY` in `conftest.py`: a
+    test that stubbed `llm.complete` but not `llm.chat` reached OpenRouter
+    with the real key.
 - **The resume never goes in the system's own autofill slot, and the letter
   knows its other names** (2026-10-03, asked for). Ashby, Workday and Lever
   all offer "upload a resume and we will fill the form in for you". That

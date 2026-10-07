@@ -52,6 +52,21 @@ MIN_WORDS_UNHEADED = 300
 
 _WORD = re.compile(r"[a-z0-9]+")
 
+# What a model is sent of a posting. Nine in ten postings on disk are under
+# 10.5k characters and go through untouched; the rest are pages that carried
+# the whole careers site with them (one was 484k characters, sent whole on
+# every attempt). Over the cap, the boilerplate lines go first and the cut
+# comes after, so the description survives and the footer does not. The
+# story pick has always used the same number.
+PROMPT_CAP = 12_000
+
+
+def for_prompt(text: str, cap: int = PROMPT_CAP) -> str:
+    """`text` as a model should see it: whole when it fits, else cleaned and cut."""
+    if len(text) <= cap:
+        return text
+    return clean(text)[:cap]
+
 
 def too_thin(text: str) -> str | None:
     """Why `text` is not worth tailoring against, or None when it is.

@@ -14,6 +14,9 @@ _BASE = Path(__file__).resolve().parent.parent / "base"
 shutil.copy(_BASE / "resume.template.tex", _HOME / "base" / "resume.tex")
 shutil.copy(_BASE / "applicant.example.md", _HOME / "base" / "applicant.md")
 os.environ["AUTOPILOT_HOME"] = str(_HOME)
+# A test that forgets to stub a model call must fail, not spend: the shell's
+# variable wins over .env, so the real key is never read.
+os.environ["OPENROUTER_API_KEY"] = "sk-or-test-not-a-key"
 
 import pytest  # noqa: E402
 

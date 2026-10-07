@@ -27,11 +27,10 @@ Only these sections:
 
 ## What may never change
 
-- Nothing above `\begin{document}`. Not one character: not the document
-  class, packages, colours, spacing knobs, or custom command definitions, and
-  not a comment, a commented-out line, or a space inside a macro. Return it
-  exactly as it came. Anything you change there is discarded and replaced by
-  the master's, so time spent on it is time not spent on the sections.
+- Nothing above `\begin{document}`: not the document class, packages,
+  colours, spacing knobs, or custom command definitions. You do not return
+  it at all - the reply is the body only, and the master's preamble is put
+  back around it.
 - The heading block: name, phone, email, location, portfolio, LinkedIn,
   GitHub, graduation date.
 - `EDUCATION` and `ACHIEVEMENTS`, entirely.
