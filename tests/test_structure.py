@@ -110,6 +110,20 @@ def test_roles_are_found_by_their_many_names():
     assert tailor._summary(PLAIN).strip().startswith("Backend engineer")
 
 
+def test_a_role_word_inside_a_longer_heading_is_that_role():
+    tex = r"""\begin{document}
+\section{Experience}
+\begin{itemize}\item Built a thing\end{itemize}
+\section{Software Engineering \& Open-Source Projects}
+\begin{itemize}\item Shipped a tool\end{itemize}
+\section{Achievements}
+Won a prize
+\end{document}"""
+    found = structure.titles(tex)
+    assert found["PROJECTS"] == "Software Engineering & Open-Source Projects"
+    assert "ACHIEVEMENTS" in found
+
+
 def test_skills_lines_in_each_shape():
     assert len(tailor._skill_lines(JAKE)) == 2
     assert tailor._skill_lines(PLAIN) == ["Languages: Java, Kotlin, SQL\\\\",

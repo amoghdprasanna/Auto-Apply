@@ -105,8 +105,22 @@ def _normal(title: str) -> str:
     return re.sub(r"[^a-z& ]", "", title.lower()).strip()
 
 
+# The word that names each role inside a longer heading. A master resume may
+# title a section for the reader rather than for us: "Software Engineering &
+# Open-Source Projects" is the PROJECTS section.
+ROLE_WORD = {"SUMMARY": "summary", "EXPERIENCE": "experience", "PROJECTS": "projects",
+             "TECHNICAL SKILLS": "skills"}
+
+
 def _key(title: str) -> str:
-    return ROLE_OF.get(_normal(title), " ".join(title.upper().split()))
+    normal = _normal(title)
+    if normal in ROLE_OF:
+        return ROLE_OF[normal]
+    words = set(re.sub(r"[^a-z ]", " ", title.lower()).split())
+    roles = [role for role, word in ROLE_WORD.items() if word in words]
+    if len(roles) == 1:
+        return roles[0]
+    return " ".join(title.upper().split())
 
 
 def headings(tex: str) -> list[Heading]:
