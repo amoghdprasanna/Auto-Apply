@@ -22,9 +22,9 @@ import time
 import urllib.request
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import paths
 from browser import chrome
@@ -62,7 +62,7 @@ class WorkshopRequest(BaseModel):
 
 
 class KeyRequest(BaseModel):
-    key: str
+    key: str = Field(max_length=300)
 
 
 class OpenRequest(BaseModel):
@@ -208,8 +208,9 @@ def write_env(path, name: str, value: str) -> None:
     os.chmod(path, 0o600)
 
 
-def check_key(key: str) -> None:
-    """Raises HTTPException unless OpenRouter accepts the key."""
+def key_account(key: str) -> dict:
+    """What OpenRouter says about a key: its label, spend and limit. Raises
+    HTTPException when it refuses the key or cannot be reached."""
     try:
         response = httpx.get(KEY_CHECK_URL, headers={"Authorization": f"Bearer {key}"},
                              timeout=15)
@@ -220,6 +221,48 @@ def check_key(key: str) -> None:
                                  "openrouter.ai/settings/keys.")
     if response.status_code >= 400:
         raise HTTPException(502, f"OpenRouter answered {response.status_code}")
+    data = (response.json() or {}).get("data") or {}
+    return {name: data.get(name) for name in
+            ("label", "usage", "usage_monthly", "limit", "limit_remaining", "is_free_tier")}
+
+
+def check_key(key: str) -> None:
+    """Raises HTTPException unless OpenRouter accepts the key."""
+    key_account(key)
+
+
+def masked(key: str) -> str:
+    """Enough of a key to tell two apart, never enough to use one."""
+    key = key.strip()
+    if len(key) < 16:
+        return "set" if key else ""
+    return f"{key[:9]}…{key[-4:]}"
+
+
+# The key endpoints answer the review page and nothing else (2026-10-06).
+# CORS is open to every origin for the extension's sake, and binding to
+# loopback keeps out other machines, not other websites: any page open in
+# the person's browser could POST a key of its own here, and from then on
+# every resume, posting and answer would travel through somebody else's
+# OpenRouter account. A browser always says where a request came from
+# (`Origin`, `Sec-Fetch-Site`), and a page cannot lie about either; the
+# Host check stops a DNS-rebinding name that resolves to 127.0.0.1 from
+# passing itself off as same-origin. A local process with no browser
+# headers is let through: it can read the .env file anyway.
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+
+
+def own_page(request: Request) -> None:
+    host = request.headers.get("host", "")
+    name = host.split("]")[0] + "]" if host.startswith("[") else host.rsplit(":", 1)[0]
+    if name not in LOCAL_HOSTS:
+        raise HTTPException(403, "the key can only be changed from the Autopilot page")
+    site = request.headers.get("sec-fetch-site")
+    if site is not None and site not in ("same-origin", "none"):
+        raise HTTPException(403, "the key can only be changed from the Autopilot page")
+    origin = request.headers.get("origin")
+    if origin is not None and origin != f"http://{host}":
+        raise HTTPException(403, "the key can only be changed from the Autopilot page")
 
 
 @router.post("/setup/open")
@@ -284,7 +327,22 @@ def setup_done() -> dict:
     return setup_status()
 
 
-@router.post("/setup/key")
+@router.get("/setup/key", dependencies=[Depends(own_page)])
+def key_status() -> dict:
+    """The key in use, masked, and what OpenRouter says about it. The key
+    itself never leaves the server."""
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    out = {"set": bool(key), "masked": masked(key), "file": str(paths.ENV_FILE),
+           "account": None, "error": ""}
+    if key:
+        try:
+            out["account"] = key_account(key)
+        except HTTPException as exc:
+            out["error"] = exc.detail
+    return out
+
+
+@router.post("/setup/key", dependencies=[Depends(own_page)])
 def set_key(body: KeyRequest) -> dict:
     key = body.key.strip()
     if not KEY_SHAPE.match(key):
@@ -294,4 +352,4 @@ def set_key(body: KeyRequest) -> dict:
     write_env(paths.ENV_FILE, "OPENROUTER_API_KEY", key)
     # The server and every script it starts from now on see it at once.
     os.environ["OPENROUTER_API_KEY"] = key
-    return setup_status()
+    return setup_status() | {"masked": masked(key)}

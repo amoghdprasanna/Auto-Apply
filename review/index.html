@@ -498,8 +498,12 @@
                          cursor: pointer; }
   header .pstat[hidden] + button.report, header .count + button.report { margin-left: auto; }
   header button.report:hover { color: var(--ink); border-color: var(--ink); }
+  header button.report.key { margin-left: .5rem; white-space: nowrap; }
+  #keyDialog dl { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; margin: 0 0 1rem; }
+  #keyDialog dt { color: var(--muted); }
+  #keyDialog dd { margin: 0; overflow-wrap: anywhere; }
   dialog.wide { width: min(640px, 94vw); }
-  dialog input[type=text] { width: 100%; padding: .5rem; border: 2px solid var(--line); background: var(--bg);
+  dialog input[type=text], dialog input[type=password] { width: 100%; padding: .5rem; border: 2px solid var(--line); background: var(--bg);
                             color: inherit; font: inherit; }
   dialog textarea.diag { font-size: 11px; min-height: 8rem; color: var(--muted); }
   dialog .choices { display: flex; gap: 1.2rem; }
@@ -529,6 +533,7 @@
   <button class="hold" id="holdFills" aria-pressed="true" hidden></button>
   <button class="pstat" id="profileStat" aria-current="false" hidden></button>
   <button class="report" id="reportOpen" title="Report a problem or request a feature">Report</button>
+  <button class="report key" id="keyOpen" title="See or replace the OpenRouter API key">API key</button>
 </header>
 
 <!-- First run: what is still missing before the first job. Shown on every
@@ -559,6 +564,22 @@
     <div class="actions" style="justify-content:flex-end;margin-bottom:0">
       <button class="act" value="cancel" formnovalidate>Cancel</button>
       <button class="act primary" id="rsend" value="send" disabled>Open on GitHub</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- The OpenRouter key: shown masked, replaced only after OpenRouter has
+     accepted the new one. The full key never comes back to the page. -->
+<dialog id="keyDialog">
+  <form method="dialog" id="keyForm">
+    <h4>OpenRouter API key</h4>
+    <dl id="keyNow"><dt>In use</dt><dd>Reading…</dd></dl>
+    <label for="keyNew">Replace it with</label>
+    <input type="password" id="keyNew" autocomplete="off" spellcheck="false" placeholder="sk-or-v1-…">
+    <p class="hint" id="keyMsg">Checked with OpenRouter before anything is saved. Kept on this Mac only.</p>
+    <div class="actions" style="justify-content:flex-end;margin-bottom:0">
+      <button class="act" value="cancel" formnovalidate>Close</button>
+      <button class="act primary" id="keySave" value="save" disabled>Check and save</button>
     </div>
   </form>
 </dialog>
@@ -2325,6 +2346,57 @@ const Onboard = (() => {
       $("rtitle").value = ""; $("rtext").value = "";
       dialog.close();
     } catch (err) { $("rmsg").textContent = err.message; }
+  };
+})();
+
+// ------------------------------------------------------------------ Key --
+// Replace the OpenRouter key whenever. The server checks the new one with
+// OpenRouter before writing it, answers only this page (`own_page`), and
+// sends back the key masked: what is in the box is the only full copy the
+// page ever holds, and it is cleared on save and on close.
+(() => {
+  const dialog = $("keyDialog");
+  const input = $("keyNew");
+  const money = (n) => (typeof n === "number" ? `$${n.toFixed(2)}` : "—");
+  const DEFAULT_MSG = "Checked with OpenRouter before anything is saved. Kept on this Mac only.";
+
+  function paint(k) {
+    const a = k.account;
+    const rows = [["In use", k.set ? escape(k.masked) : "No key saved"]];
+    if (a) {
+      rows.push(["Spent", `${money(a.usage)} in total, ${money(a.usage_monthly)} this month`]);
+      rows.push(["Limit", a.limit == null ? "None set on the key"
+        : `${money(a.limit)}, ${money(a.limit_remaining)} left`]);
+    } else if (k.error) rows.push(["OpenRouter", escape(k.error)]);
+    rows.push(["Saved in", `<code>${escape(k.file)}</code>`]);
+    $("keyNow").innerHTML = rows.map(([t, d]) => `<dt>${t}</dt><dd>${d}</dd>`).join("");
+  }
+
+  async function load() {
+    $("keyNow").innerHTML = "<dt>In use</dt><dd>Reading…</dd>";
+    try { paint(await api("/setup/key")); }
+    catch (err) { $("keyNow").innerHTML = `<dt>In use</dt><dd>${escape(err.message)}</dd>`; }
+  }
+
+  $("keyOpen").onclick = () => {
+    input.value = ""; $("keySave").disabled = true; $("keyMsg").textContent = DEFAULT_MSG;
+    dialog.showModal(); load();
+  };
+  dialog.addEventListener("close", () => { input.value = ""; });
+  input.oninput = () => { $("keySave").disabled = !input.value.trim(); };
+  $("keySave").onclick = async (e) => {
+    e.preventDefault();
+    $("keySave").disabled = true; $("keyMsg").textContent = "Checking with OpenRouter…";
+    try {
+      const r = await api("/setup/key", { method: "POST", body: JSON.stringify({ key: input.value }) });
+      input.value = "";
+      $("keyMsg").textContent = `Saved. ${r.masked} is in use from the next call on; a fill already running keeps the old one.`;
+      load();
+      Setup.poll();
+    } catch (err) {
+      $("keyMsg").textContent = err.message;
+      $("keySave").disabled = !input.value.trim();
+    }
   };
 })();
 

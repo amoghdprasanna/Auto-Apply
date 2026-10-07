@@ -197,12 +197,49 @@ def test_key_is_checked_then_written(tmp_path, monkeypatch):
     monkeypatch.setattr(prompts_api.paths, "ENV_FILE", env)
     monkeypatch.setattr(prompts_api, "check_key", lambda key: None)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    client = TestClient(app)
+    client = TestClient(app, base_url=PAGE)
     assert client.post("/setup/key", json={"key": "hello"}).status_code == 400
     key = "sk-or-v1-" + "a" * 40
     assert client.post("/setup/key", json={"key": key}).json()["key"] is True
     assert env.read_text() == f"OPENROUTER_API_KEY={key}\nOTHER=1\n"
     monkeypatch.delenv("OPENROUTER_API_KEY")
+
+
+PAGE = "http://127.0.0.1:8787"
+KEY = "sk-or-v1-" + "b" * 40
+
+
+def test_another_website_cannot_change_the_key(tmp_path, monkeypatch):
+    """CORS is open for the extension, so the browser lets any page POST
+    here; the key endpoints refuse what the browser says came from elsewhere."""
+    env = tmp_path / ".env"
+    monkeypatch.setattr(prompts_api.paths, "ENV_FILE", env)
+    monkeypatch.setattr(prompts_api, "check_key", lambda key: None)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-" + "c" * 40)
+    client = TestClient(app, base_url=PAGE)
+    for headers in ({"Origin": "https://evil.example"},
+                    {"Sec-Fetch-Site": "cross-site"},
+                    {"Origin": "http://localhost:8787"}):     # not the page it is served on
+        assert client.post("/setup/key", json={"key": KEY}, headers=headers).status_code == 403
+        assert client.get("/setup/key", headers=headers).status_code == 403
+    # A name that resolves to 127.0.0.1 is still not this page.
+    rebound = TestClient(app, base_url="http://attacker.example:8787")
+    assert rebound.post("/setup/key", json={"key": KEY}).status_code == 403
+    assert not env.exists()
+    # The page itself, as Chrome sends it.
+    own = {"Origin": PAGE, "Sec-Fetch-Site": "same-origin"}
+    assert client.post("/setup/key", json={"key": KEY}, headers=own).json()["masked"] == "sk-or-v1-…bbbb"
+    assert env.read_text() == f"OPENROUTER_API_KEY={KEY}\n"
+
+
+def test_the_key_comes_back_masked(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
+    monkeypatch.setattr(prompts_api, "key_account",
+                        lambda key: {"label": "x", "usage": 1.5, "limit": 5, "limit_remaining": 3.5})
+    body = TestClient(app, base_url=PAGE).get("/setup/key").json()
+    assert body["set"] and body["masked"] == "sk-or-v1-…bbbb"
+    assert body["account"]["limit_remaining"] == 3.5
+    assert KEY not in json.dumps(body)
 
 
 def test_onboarding_until_done_or_a_job_exists(tmp_path, monkeypatch):

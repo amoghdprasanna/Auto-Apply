@@ -1440,6 +1440,18 @@ invariants first.
   person's own stand; `fill_field` still refuses a visa question and writes
   nothing the profile has no answer for; each field it sets carries the logo
   as before. `AUTOPILOT_PROFILE_FALLBACK=0` turns it off.
+- **The OpenRouter key can be replaced any time, and only from the page**
+  (2026-10-06, asked for). The header's **API key** button opens a dialog:
+  the key in use, masked (`sk-or-v1-…abcd`), what OpenRouter says it has
+  spent and has left, and the `.env` it lives in; a new key is checked with
+  OpenRouter before it is written (`POST /setup/key`, the same path the
+  onboarding uses). `GET /setup/key` never returns the key itself. **Both
+  are behind `own_page`**: CORS is `*` for the extension, so before this
+  any website open in the browser could POST its own key here and receive
+  every resume and posting from then on. A request whose `Origin` or
+  `Sec-Fetch-Site` says another site, or whose `Host` is not a loopback
+  name (DNS rebinding), gets 403. The rest of the API is still open that
+  way - `/review/{id}/submit` included - and wants the same guard next.
 - Whatever comes next lands here first, one line each, with the date.
 
 ## What the review page shows
